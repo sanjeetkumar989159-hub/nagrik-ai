@@ -1,21 +1,29 @@
 import { db, storage, isFirebaseConfigured } from './firebase';
-import { 
-  collection, 
-  doc, 
-  setDoc, 
-  getDoc, 
-  getDocs, 
-  updateDoc, 
-  query, 
-  where, 
-  orderBy, 
-  onSnapshot, 
+import {
+  collection,
+  doc,
+  setDoc,
+  getDoc,
+  updateDoc,
+  query,
+  where,
+  orderBy,
+  onSnapshot,
   serverTimestamp,
-  addDoc 
+  addDoc
 } from 'firebase/firestore';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { createNotification } from './notificationService';
-import { DEFAULT_DEPARTMENTS, getDepartmentById } from './departmentService';
+import { getDepartmentById } from './departmentService';
+import {
+  validateComplaintInput,
+  validateImageFile,
+  findDuplicateComplaint,
+  validateStatusTransition,
+  checkClientRateLimit,
+  assertAdminAuthorized,
+  sanitizeText
+} from '../utils/security';
 
 // 10 Official Categories with Subcategories
 export const COMPLAINT_CATEGORIES = [
@@ -359,16 +367,27 @@ function saveLocalComplaints(list) {
   }
 }
 
-// Upload actual image to Firebase Storage
+// Upload actual image to Firebase Storage with strict validation
 export async function uploadComplaintImage(file, complaintId) {
   if (!file) return null;
 
-  // Simple client‑side compression using canvas (only for images)
+  const fileValidation = validateImageFile(file);
+  if (!fileValidation.valid) {
+    const err = new Error(fileValidation.error);
+    err.code = 'INVALID_IMAGE_FILE';
+    throw err;
+  }
+
+  // Client-side compression using canvas when supported in browser
   const compressImage = (blob) => new Promise((resolve) => {
+    if (typeof Image === 'undefined' || typeof document === 'undefined' || !URL?.createObjectURL) {
+      resolve(blob);
+      return;
+    }
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      const maxDim = 1024; // max width/height
+      const maxDim = 1024;
       let { width, height } = img;
       if (width > height) {
         if (width > maxDim) { height = Math.round((height * maxDim) / width); width = maxDim; }
@@ -379,26 +398,26 @@ export async function uploadComplaintImage(file, complaintId) {
       canvas.height = height;
       const ctx = canvas.getContext('2d');
       ctx.drawImage(img, 0, 0, width, height);
-      canvas.toBlob((compressed) => resolve(compressed), file.type, 0.7);
+      canvas.toBlob((compressed) => resolve(compressed || blob), file.type, 0.75);
     };
+    img.onerror = () => resolve(blob);
     img.src = URL.createObjectURL(blob);
   });
 
   let fileToUpload = file;
   try {
-    // If it's an image, compress it before upload
     if (file.type.startsWith('image/')) {
       fileToUpload = await compressImage(file);
     }
-  } catch (e) {
-    console.warn('Compression failed, using original file', e);
+  } catch {
+    fileToUpload = file;
   }
 
   if (isFirebaseConfigured() && storage) {
     try {
-      const extension = fileToUpload.name.split('.').pop() || 'jpg';
+      const extension = (file.name && file.name.split('.').pop()) || 'jpg';
       const storageRef = ref(storage, `complaints/${complaintId}/${Date.now()}_evidence.${extension}`);
-      const uploadResult = await uploadBytes(storageRef, fileToUpload, { contentType: fileToUpload.type });
+      const uploadResult = await uploadBytes(storageRef, fileToUpload, { contentType: file.type });
       const downloadUrl = await getDownloadURL(uploadResult.ref);
       return downloadUrl;
     } catch (err) {
@@ -406,20 +425,57 @@ export async function uploadComplaintImage(file, complaintId) {
     }
   }
 
-  // Fallback to Base64 DataURL (no compression here)
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Failed to read image file.'));
     reader.readAsDataURL(fileToUpload);
   });
 }
-export async function createComplaintRecord(complaintInput, imageFile = null) {
+
+export { getLocalComplaints, saveLocalComplaints };
+
+export async function createComplaintRecord(complaintInput, imageFile = null, options = {}) {
+  // 1. Validate & sanitize all inputs server/service-side
+  const validation = validateComplaintInput(complaintInput);
+  if (!validation.valid) {
+    const firstMsg = Object.values(validation.errors)[0] || 'Invalid complaint input.';
+    const err = new Error(firstMsg);
+    err.code = 'VALIDATION_ERROR';
+    err.validationErrors = validation.errors;
+    throw err;
+  }
+
+  const clean = validation.sanitized;
+
+  // 2. Client-side rate limiting guard
+  if (!options.skipRateLimit) {
+    const rate = checkClientRateLimit(clean.userId || 'guest-user', 5, 60 * 1000);
+    if (!rate.allowed) {
+      const err = new Error(`Too many submissions. Please wait ${rate.retryAfterSeconds}s before submitting again.`);
+      err.code = 'RATE_LIMIT_EXCEEDED';
+      throw err;
+    }
+  }
+
+  // 3. Duplicate submission detection
+  const currentList = getLocalComplaints();
+  if (!options.allowDuplicate) {
+    const dup = findDuplicateComplaint(clean, currentList);
+    if (dup) {
+      const err = new Error(`Potential duplicate complaint detected (${dup.matchedComplaintId}): ${dup.reason}`);
+      err.code = 'DUPLICATE_COMPLAINT';
+      err.matchedComplaintId = dup.matchedComplaintId;
+      throw err;
+    }
+  }
+
   const complaintId = generateComplaintId();
-  const categoryConfig = COMPLAINT_CATEGORIES.find(c => c.id === complaintInput.category) || COMPLAINT_CATEGORIES[0];
+  const categoryConfig = COMPLAINT_CATEGORIES.find(c => c.id === clean.category) || COMPLAINT_CATEGORIES[0];
   const deptConfig = getDepartmentById(categoryConfig.departmentId);
 
-  // Upload image
-  let uploadedImageUrl = complaintInput.imageUrl || '';
+  // 4. Upload & validate image
+  let uploadedImageUrl = clean.imageUrl || '';
   if (imageFile) {
     uploadedImageUrl = await uploadComplaintImage(imageFile, complaintId);
   }
@@ -427,27 +483,28 @@ export async function createComplaintRecord(complaintInput, imageFile = null) {
   const newDocData = {
     id: complaintId,
     complaintId: complaintId,
-    userId: complaintInput.userId || 'guest-user',
-    citizenName: complaintInput.citizenName || 'Citizen',
-    citizenPhone: complaintInput.citizenPhone || '',
-    citizenEmail: complaintInput.citizenEmail || '',
-    title: complaintInput.title.trim(),
-    description: complaintInput.description.trim(),
-    category: complaintInput.category,
+    userId: sanitizeText(clean.userId || 'guest-user', 80),
+    citizenName: clean.citizenName,
+    citizenPhone: clean.citizenPhone,
+    citizenEmail: clean.citizenEmail,
+    title: clean.title,
+    description: clean.description,
+    category: clean.category,
     categoryName: categoryConfig.name,
-    subcategory: complaintInput.subcategory || categoryConfig.subcategories[0],
-    severity: complaintInput.severity || 'Medium',
+    subcategory: sanitizeText(clean.subcategory || categoryConfig.subcategories[0], 100),
+    severity: clean.severity || 'Medium',
+    priority: clean.severity || 'Medium',
     departmentId: deptConfig.id,
     departmentName: deptConfig.name,
     status: 'Submitted',
-    address: complaintInput.address.trim(),
-    latitude: complaintInput.latitude ? Number(complaintInput.latitude) : 28.6139,
-    longitude: complaintInput.longitude ? Number(complaintInput.longitude) : 77.2090,
-    ward: complaintInput.ward || 'Ward 01 - Connaught Hub',
-    landmark: complaintInput.landmark ? complaintInput.landmark.trim() : '',
+    address: clean.address,
+    latitude: clean.latitude !== undefined ? Number(clean.latitude) : 28.6139,
+    longitude: clean.longitude !== undefined ? Number(clean.longitude) : 77.2090,
+    ward: sanitizeText(clean.ward || 'Ward 01 - Connaught Hub', 100),
+    landmark: clean.landmark || '',
     imageUrls: uploadedImageUrl ? [uploadedImageUrl] : [],
     resolutionProofUrl: '',
-    aiAnalysis: complaintInput.aiAnalysis || null,
+    aiAnalysis: clean.aiAnalysis || null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     timeline: [
@@ -455,8 +512,8 @@ export async function createComplaintRecord(complaintInput, imageFile = null) {
         id: `tl-${Date.now()}`,
         status: 'Submitted',
         title: 'Complaint Registered',
-        remarks: 'Complaint lodged by citizen with photograph and location coordinates.',
-        officer: complaintInput.citizenName || 'Citizen Portal Automated Intake',
+        remarks: 'Complaint lodged by citizen with validated inputs and location coordinates.',
+        officer: clean.citizenName || 'Citizen Portal Automated Intake',
         timestamp: new Date().toISOString()
       }
     ]
@@ -475,7 +532,7 @@ export async function createComplaintRecord(complaintInput, imageFile = null) {
         status: 'Submitted',
         title: 'Complaint Registered',
         remarks: 'Complaint lodged by citizen with photograph and location coordinates.',
-        officer: complaintInput.citizenName || 'Citizen Portal Automated Intake',
+        officer: clean.citizenName || 'Citizen Portal Automated Intake',
         timestamp: serverTimestamp()
       });
 
@@ -502,8 +559,8 @@ export async function createComplaintRecord(complaintInput, imageFile = null) {
   }
 
   // Save to local backup as well to guarantee persistence
-  const currentList = getLocalComplaints();
-  saveLocalComplaints([newDocData, ...currentList]);
+  const latestList = getLocalComplaints();
+  saveLocalComplaints([newDocData, ...latestList]);
 
   // Also create local notification
   await createNotification(
@@ -642,19 +699,37 @@ export function subscribeAllComplaints(callback) {
   return () => window.removeEventListener('storage', handler);
 }
 
-// Update complaint status & assign department (Admin operation)
+// Update complaint status & assign department (Admin operation - authorization enforced)
 export async function updateComplaintStatusFirestore(
-  complaintId, 
-  newStatus, 
-  remarks = '', 
-  resolutionPhotoFile = null, 
+  complaintId,
+  newStatus,
+  remarks = '',
+  resolutionPhotoFile = null,
   assignedDepartmentId = null,
-  assignedOfficer = ''
+  assignedOfficer = '',
+  actorContext = null
 ) {
+  // Enforce administrative authorization before any state mutation
+  assertAdminAuthorized(actorContext);
+
+  const localList = getLocalComplaints();
+  const existingRecord = localList.find(c => c.id === complaintId);
+  const currentStatus = existingRecord?.status || 'Submitted';
+
+  const transitionCheck = validateStatusTransition(currentStatus, newStatus, remarks);
+  if (!transitionCheck.valid) {
+    const err = new Error(transitionCheck.error);
+    err.code = 'INVALID_STATUS_TRANSITION';
+    throw err;
+  }
+
+  const cleanRemarks = transitionCheck.sanitizedRemarks;
+  const cleanOfficer = sanitizeText(assignedOfficer, 100) || 'Municipal Administrative Officer';
+
   let resolutionPhotoUrl = '';
   if (resolutionPhotoFile) {
     if (typeof resolutionPhotoFile === 'string') {
-      resolutionPhotoUrl = resolutionPhotoFile;
+      resolutionPhotoUrl = sanitizeText(resolutionPhotoFile, 500);
     } else {
       resolutionPhotoUrl = await uploadComplaintImage(resolutionPhotoFile, `${complaintId}_resolution`);
     }
@@ -664,8 +739,8 @@ export async function updateComplaintStatusFirestore(
     id: `tl-${Date.now()}`,
     status: newStatus,
     title: `Status Updated to ${newStatus}`,
-    remarks: remarks || `Workflow status transitioned to ${newStatus}.`,
-    officer: assignedOfficer || 'Municipal Administrative Officer',
+    remarks: cleanRemarks || `Workflow status transitioned to ${newStatus}.`,
+    officer: cleanOfficer,
     timestamp: new Date().toISOString()
   };
 
@@ -678,7 +753,7 @@ export async function updateComplaintStatusFirestore(
       if (snap.exists()) {
         targetUserId = snap.data().userId;
         const currentTimeline = snap.data().timeline || [];
-        
+
         const updatePayload = {
           status: newStatus,
           updatedAt: serverTimestamp(),
@@ -695,70 +770,72 @@ export async function updateComplaintStatusFirestore(
           updatePayload.departmentName = dept.name;
         }
 
-        if (assignedOfficer) {
-          updatePayload.assignedOfficer = assignedOfficer;
+        if (cleanOfficer) {
+          updatePayload.assignedOfficer = cleanOfficer;
         }
 
         await updateDoc(docRef, updatePayload);
 
-        // Subcollection entry
         await addDoc(collection(db, 'complaints', complaintId, 'updates'), {
           status: newStatus,
-          remarks: remarks || `Status marked as ${newStatus}`,
-          officer: assignedOfficer || 'Municipal Administrative Officer',
+          remarks: cleanRemarks || `Status marked as ${newStatus}`,
+          officer: cleanOfficer,
           timestamp: serverTimestamp()
         });
 
-        // Audit log
         await addDoc(collection(db, 'audit_logs'), {
           complaintId,
           action: `STATUS_CHANGE_${newStatus.toUpperCase()}`,
-          officer: assignedOfficer || 'Admin',
+          officer: cleanOfficer,
           timestamp: serverTimestamp()
         });
       }
     } catch (err) {
-      console.error('Firestore status update error:', err);
+      if (err?.code === 'permission-denied' || err?.code === 'unauthenticated') {
+        throw err;
+      }
+      console.warn('Firestore status update unreachable, applying local state fallback:', err?.message || err);
     }
   }
 
-  // Update local backup
+  // Update local record
   const list = getLocalComplaints();
   const index = list.findIndex(c => c.id === complaintId);
-  if (index !== -1) {
-    const item = { ...list[index] };
-    targetUserId = item.userId;
-    item.status = newStatus;
-    item.updatedAt = new Date().toISOString();
-    item.timeline = [...(item.timeline || []), newTimelineEvent];
-
-    if (resolutionPhotoUrl) {
-      item.resolutionProofUrl = resolutionPhotoUrl;
-    }
-    if (assignedDepartmentId) {
-      const dept = getDepartmentById(assignedDepartmentId);
-      item.departmentId = dept.id;
-      item.departmentName = dept.name;
-    }
-    if (assignedOfficer) {
-      item.assignedOfficer = assignedOfficer;
-    }
-
-    list[index] = item;
-    saveLocalComplaints(list);
+  if (index === -1) {
+    const err = new Error(`Complaint record "${complaintId}" not found.`);
+    err.code = 'COMPLAINT_NOT_FOUND';
+    throw err;
   }
 
-  // Create citizen notification
+  const item = { ...list[index] };
+  targetUserId = item.userId;
+  item.status = newStatus;
+  item.updatedAt = new Date().toISOString();
+  item.timeline = [...(item.timeline || []), newTimelineEvent];
+
+  if (resolutionPhotoUrl) {
+    item.resolutionProofUrl = resolutionPhotoUrl;
+  }
+  if (assignedDepartmentId) {
+    const dept = getDepartmentById(assignedDepartmentId);
+    item.departmentId = dept.id;
+    item.departmentName = dept.name;
+  }
+  item.assignedOfficer = cleanOfficer;
+
+  list[index] = item;
+  saveLocalComplaints(list);
+
   if (targetUserId) {
     await createNotification(
       targetUserId,
       `Complaint ${complaintId} Status: ${newStatus}`,
-      remarks || `Your complaint has been updated to ${newStatus}.`,
+      cleanRemarks || `Your complaint has been updated to ${newStatus}.`,
       complaintId,
       'status_update'
     );
   }
 
-  return true;
+  return item;
 }
 

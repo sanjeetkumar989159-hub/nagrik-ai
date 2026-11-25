@@ -1,0 +1,45 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && 
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Complaint evidence photographs
+    match /complaints/{complaintId}/{allPaths=**} {
+      // Public read for viewing civic complaints
+      allow read: if true;
+
+      // Authenticated users can upload photographs with strict validation
+      allow create: if isAuthenticated() &&
+                    request.resource.size < 5 * 1024 * 1024 && // Max 5MB
+                    request.resource.contentType.matches('image/(jpeg|png|webp|jpg)');
+
+      // Only admin can delete or overwrite
+      allow update, delete: if isAdmin();
+    }
+
+    // Resolution proof photographs uploaded by field officers
+    match /resolutions/{complaintId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAdmin() &&
+                   request.resource.size < 5 * 1024 * 1024 &&
+                   request.resource.contentType.matches('image/(jpeg|png|webp|jpg)');
+    }
+
+    // User profile avatars
+    match /profiles/{userId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAuthenticated() && request.auth.uid == userId &&
+                   request.resource.size < 2 * 1024 * 1024 &&
+                   request.resource.contentType.matches('image/(jpeg|png|webp|jpg)');
+    }
+  }
+}
+
